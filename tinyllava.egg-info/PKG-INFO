@@ -1,0 +1,88 @@
+Metadata-Version: 2.4
+Name: tinyllava
+Version: 1.0.0
+Summary: A Framework of Small-scale Large Multimodal Models.
+Project-URL: Homepage, https://github.com/DLCV-BUAA/TinyLLaVABench
+Project-URL: Bug Tracker, https://github.com/DLCV-BUAA/TinyLLaVABench/issues
+Classifier: Programming Language :: Python :: 3
+Classifier: License :: OSI Approved :: Apache Software License
+Requires-Python: >=3.9
+Description-Content-Type: text/markdown
+Requires-Dist: torch==2.0.1
+Requires-Dist: torchvision==0.15.2
+Requires-Dist: tiktoken
+Requires-Dist: openpyxl
+Requires-Dist: tensorboardX
+Requires-Dist: transformers==4.40.1
+Requires-Dist: tokenizers==0.19.0
+Requires-Dist: sentencepiece==0.1.99
+Requires-Dist: shortuuid
+Requires-Dist: accelerate==0.27.2
+Requires-Dist: bitsandbytes==0.41.0
+Requires-Dist: peft==0.10.0
+Requires-Dist: pydantic<2,>=1
+Requires-Dist: markdown2[all]
+Requires-Dist: numpy==1.26.4
+Requires-Dist: scikit-learn==1.2.2
+Requires-Dist: gradio==3.35.2
+Requires-Dist: gradio_client==0.2.9
+Requires-Dist: requests
+Requires-Dist: httpx==0.24.0
+Requires-Dist: uvicorn
+Requires-Dist: fastapi
+Requires-Dist: einops==0.6.1
+Requires-Dist: einops-exts==0.0.4
+Requires-Dist: timm==0.6.13
+Requires-Dist: deepspeed==0.14.0
+Requires-Dist: ninja
+Requires-Dist: wandb
+Provides-Extra: train
+Requires-Dist: deepspeed==0.14.0; extra == "train"
+Requires-Dist: ninja; extra == "train"
+Requires-Dist: wandb; extra == "train"
+
+# SigPhi-Med: A Lightweight Vision-Language Assistant for Biomedicine
+
+## Introduction
+SigPhi-Med is a lightweight vision-language model designed for biomedical applications. It leverages compact architectures while maintaining strong performance in visual question answering (VQA) and related multimodal tasks. This repository provides code for training, evaluation, and model deployment.
+
+## Results
+<p align="center">
+    <img src="assets/results.png" width="70%" />
+</p>
+
+## Installation
+To set up the environment, refer to [TinyLLaVA Factory](https://github.com/TinyLLaVA/TinyLLaVA_Factory) and `requirements.txt` file.
+
+## Model Weights
+- [Huggingface](https://huggingface.co/nykxo99/SigPhi-Med)
+
+## Datasets
+SigPhi-Med is trained and evaluated on the following biomedical multimodal datasets:
+
+- [LLaVA-Med Dataset](https://github.com/microsoft/LLaVA-Med)
+- [PubMedVision Dataset](https://huggingface.co/datasets/FreedomIntelligence/PubMedVision)
+
+## Training
+To train SigPhi-Med, modify the training script as needed:
+
+1. Edit the configuration in `scripts/train/train_phi.sh`.
+2. Run the training script:
+
+```bash
+sh scripts/train/train_phi.sh
+```
+
+## Evaluation
+To evaluate the model on biomedical VQA tasks, use:
+
+```bash
+sh scripts/eval/VQA.sh
+```
+
+## Acknowledgements
+We appreciate the contributions of the following projects:
+- [TinyLLaVA](https://github.com/TinyLLaVA/TinyLLaVA_Factory)
+- [LLaVA-Med Dataset](https://github.com/microsoft/LLaVA-Med)
+- [PubMedVision Dataset](https://huggingface.co/datasets/FreedomIntelligence/PubMedVision)
+
