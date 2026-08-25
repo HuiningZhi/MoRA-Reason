@@ -10,7 +10,7 @@ FINETUNE_DOWN_IMAGE_PATH=/root/autodl-tmp/dataset/3vqa/images #finetune downstre
 REASON_DATA_PATH=/HNA/dataset/3vqa/train_all_fle_reason.json
 REASON_IMAGE_PATH=/HNA/dataset/3vqa/images
 
-REASON_DATA_PATH2=/HNA/dataset/3vqa/train_all_fle_reason_delete.json
+REASON_DATA_PATH2=/HNA/dataset/3vqa/train_all_fle_reason_filter.json
 REASON_IMAGE_PATH2=/HNA/dataset/3vqa/images
 
 LLM_VERSION=/HNA/model/Phi-4-mini-instruct # llm path in huggingface
