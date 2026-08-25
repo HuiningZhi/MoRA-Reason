@@ -1,26 +1,109 @@
 """
-Phi3 MLP 替换为 MMOELoraLinearS
-双门控 + DeepSpeed 兼容版本
+Replace Phi3 MLP projections with MMOELoraLinearS.
+
+Each replaced projection owns an independent task gate:
+- layer_i.mlp.gate_up_proj.task_gate
+- layer_i.mlp.down_proj.task_gate
+
+The input task_id is still shared across all projections for a sample, but every
+projection learns its own task_id -> expert routing.
 """
 import torch
 import torch.nn as nn
 from transformers.models.phi3.modeling_phi3 import Phi3MLP
+
 from src.MLoRA.peft.tuners.mmoeloraS import MMOELoraLinearS
 
 
-# ✅ 温度 Softmax（可选，用于控制门控锐度）
 class TemperatureSoftmax(nn.Module):
     def __init__(self, temperature=1.0, dim=-1):
         super().__init__()
         self.temperature = temperature
         self.dim = dim
-    
+
     def forward(self, x):
         return nn.functional.softmax(x / self.temperature, dim=self.dim)
 
 
-# ✅ 双门控注册表
-_DUAL_GATE_REGISTRY = {}
+def create_task_gate(task_num, task_embedding_dim, expert_num, device="cpu", temperature=1.0):
+    gate = nn.Sequential(
+        nn.Embedding(task_num + 1, task_embedding_dim),
+        nn.Linear(task_embedding_dim, expert_num, bias=False),
+        TemperatureSoftmax(temperature=temperature, dim=-1),
+    )
+    nn.init.normal_(gate[0].weight, std=0.1)
+    nn.init.normal_(gate[1].weight, std=0.5)
+    return gate.to(device)
+
+
+def iter_moelora_projections(model):
+    if not hasattr(model, "model") or not hasattr(model.model, "layers"):
+        return
+    for layer_idx, layer in enumerate(model.model.layers):
+        if not hasattr(layer, "mlp"):
+            continue
+        for proj_name in ("gate_up_proj", "down_proj"):
+            if not hasattr(layer.mlp, proj_name):
+                continue
+            proj = getattr(layer.mlp, proj_name)
+            if isinstance(proj, MMOELoraLinearS):
+                yield layer_idx, proj_name, proj
+
+
+def get_moelora_gate(proj):
+    if hasattr(proj, "task_gate"):
+        return proj.task_gate
+    if hasattr(proj, "_global_gate") and proj._global_gate is not None:
+        return proj._global_gate
+    return None
+
+
+def is_moelora_gate_parameter_name(name):
+    return ".task_gate." in name or "global_task_gate_A" in name or "global_task_gate_B" in name
+
+
+def count_projection_gates(model):
+    gate_up = 0
+    down = 0
+    params = 0
+    for _, proj_name, proj in iter_moelora_projections(model):
+        gate = get_moelora_gate(proj)
+        if gate is None:
+            continue
+        if proj_name == "gate_up_proj":
+            gate_up += 1
+        elif proj_name == "down_proj":
+            down += 1
+        params += sum(p.numel() for p in gate.parameters())
+    return {"gate_up": gate_up, "down": down, "total": gate_up + down, "params": params}
+
+
+def print_moelora_gate_samples(model, title, task_mapping=None, max_layers=2):
+    task_mapping = task_mapping or {"OPEN": 0, "CLOSED": 1}
+    projections = list(iter_moelora_projections(model))
+    if not projections:
+        print(f"{title}: no MMOELoRA projections found")
+        return
+
+    selected = projections[: max_layers * 2]
+    print("\n" + "=" * 80)
+    print(title)
+    print("=" * 80)
+    with torch.no_grad():
+        for task_name, task_id in task_mapping.items():
+            print(f"\n{task_name} (Task ID={task_id}):")
+            for layer_idx, proj_name, proj in selected:
+                gate = get_moelora_gate(proj)
+                if gate is None:
+                    print(f"  Layer {layer_idx}.{proj_name}: no task_gate")
+                    continue
+                gate_device = next(gate.parameters()).device
+                task_tensor = torch.tensor([task_id], dtype=torch.long, device=gate_device)
+                weights = gate(task_tensor)[0].detach().cpu()
+                max_expert = int(weights.argmax().item())
+                weights_str = ", ".join(f"{float(w):.4f}" for w in weights)
+                print(f"  Layer {layer_idx}.{proj_name}: [{weights_str}] -> expert {max_expert}")
+    print("=" * 80 + "\n")
 
 
 def replace_phi3mlp_with_mmoeloraS(
@@ -33,300 +116,213 @@ def replace_phi3mlp_with_mmoeloraS(
     task_embedding_dim=32,
     adapter_name="default",
     device="cpu",
-    temperature=1.0
+    temperature=1.0,
 ):
     """
-    使用双门控的 MMOELoraLinearS 替换 Phi3MLP
-    
-    ✅ Gate A 用于 gate_up_proj
-    ✅ Gate B 用于 down_proj
-    ✅ 两个门控独立训练
-    ✅ DeepSpeed 兼容：通过 forward 传递门控，避免共享参数问题
-    ✅ 使用全局注册表：避免循环引用导致的递归错误
+    Replace Phi3MLP gate_up_proj/down_proj with MMOELoraLinearS.
+
+    Unlike the previous dual-global-gate implementation, this creates one gate
+    per projection. Layer 0 gate_up, layer 1 gate_up, layer 0 down, etc. all
+    route independently while receiving the same task_id value.
     """
-    print("\n🔧 Replacing Phi3MLP layers with MMOELoraLinearS (Dual Independent Gates)...")
-    
-    # ✅ 创建 Gate A（用于 gate_up_proj）
-    gate_A = nn.Sequential(
-        nn.Embedding(task_num + 1, task_embedding_dim),
-        nn.Linear(task_embedding_dim, expert_num, bias=False),
-        TemperatureSoftmax(temperature=temperature, dim=-1)
-    )
-    nn.init.normal_(gate_A[0].weight, std=0.1)
-    nn.init.normal_(gate_A[1].weight, std=0.5)
-    gate_A = gate_A.to(device)
-    
-    # ✅ 创建 Gate B（用于 down_proj）
-    gate_B = nn.Sequential(
-        nn.Embedding(task_num + 1, task_embedding_dim),
-        nn.Linear(task_embedding_dim, expert_num, bias=False),
-        TemperatureSoftmax(temperature=temperature, dim=-1)
-    )
-    nn.init.normal_(gate_B[0].weight, std=0.1)
-    nn.init.normal_(gate_B[1].weight, std=0.5)
-    gate_B = gate_B.to(device)
-    
-    gate_a_params = sum(p.numel() for p in gate_A.parameters())
-    gate_b_params = sum(p.numel() for p in gate_B.parameters())
-    model_id = id(model)
-    
-    print(f"  🔧 Created DUAL independent gates:  {task_num} tasks → {expert_num} experts")
-    print(f"      Model ID: {model_id}")
-    print(f"      Gate A (gate_up_proj) params: {gate_a_params:,}")
-    print(f"      Gate B (down_proj) params:    {gate_b_params:,}")
-    print(f"      Temperature: {temperature}")
-    print(f"      Device: {device}")
-    
-    # ✅ 关键1：将两个门控注册为模型的直接子模块
-    model.global_task_gate_A = gate_A
-    model.global_task_gate_B = gate_B
-    
-    # ✅ 关键2：注册到全局字典（使用模型 ID）
-    _DUAL_GATE_REGISTRY[model_id] = {
-        'gate_A': gate_A,
-        'gate_B': gate_B
-    }
-    
+    print("\nReplacing Phi3MLP projections with MMOELoraLinearS (projection-local gates)...")
+
     replaced_count = 0
-    
+    gate_param_total = 0
+
     for layer_idx, layer in enumerate(model.model.layers):
-        if hasattr(layer, 'mlp'):
-            mlp = layer.mlp
-            
-            # ✅ 只存储模型 ID，不存储模型引用
-            mlp._root_model_id = model_id
-            
-            for proj_name in ['gate_up_proj', 'down_proj']:
-                if not hasattr(mlp, proj_name):
-                    continue
-                
-                old_proj = getattr(mlp, proj_name)
-                if not isinstance(old_proj, nn.Linear):
-                    continue
-                
-                # 创建新的 MMOELoraLinearS
-                new_proj = MMOELoraLinearS(
-                    adapter_name=adapter_name,
-                    in_features=old_proj.in_features,
-                    out_features=old_proj.out_features,
-                    r=lora_r,
-                    lora_alpha=lora_alpha,
-                    lora_dropout=lora_dropout,
-                    fan_in_fan_out=False,
-                    init_lora_weights=True,
-                    bias=(old_proj.bias is not None),
-                    expert_num=expert_num
-                )
-                
-                # 复制原始权重
-                with torch.no_grad():
-                    new_proj.weight.copy_(old_proj.weight)
-                    if hasattr(old_proj, 'bias') and old_proj.bias is not None:
-                        new_proj.bias.copy_(old_proj.bias)
-                
-                new_proj = new_proj.to(device)
-                
-                # ✅ 存储元信息（不存储门控本身）
-                new_proj.task_num = task_num
-                new_proj.task_embedding_dim = task_embedding_dim
-                new_proj.expert_num = expert_num
-                new_proj._layer_idx = layer_idx
-                new_proj._proj_name = proj_name
-                
-                setattr(mlp, proj_name, new_proj)
-                replaced_count += 1
-                
-                if layer_idx < 2:
-                    gate_type = "Gate A" if proj_name == 'gate_up_proj' else "Gate B"
-                    print(f"    Layer {layer_idx}.{proj_name}: Created (will use {gate_type})")
-    
-    print(f"\n🎉 Total replaced: {replaced_count} linear layers")
-    print(f"📌 Gate A & B independently trained ({gate_a_params + gate_b_params:,} total gate params)")
-    
+        if not hasattr(layer, "mlp"):
+            continue
+        mlp = layer.mlp
+
+        for proj_name in ("gate_up_proj", "down_proj"):
+            if not hasattr(mlp, proj_name):
+                continue
+
+            old_proj = getattr(mlp, proj_name)
+            if isinstance(old_proj, MMOELoraLinearS):
+                continue
+            if not isinstance(old_proj, nn.Linear):
+                continue
+
+            new_proj = MMOELoraLinearS(
+                adapter_name=adapter_name,
+                in_features=old_proj.in_features,
+                out_features=old_proj.out_features,
+                r=lora_r,
+                lora_alpha=lora_alpha,
+                lora_dropout=lora_dropout,
+                fan_in_fan_out=False,
+                init_lora_weights=True,
+                bias=(old_proj.bias is not None),
+                expert_num=expert_num,
+            )
+
+            with torch.no_grad():
+                new_proj.weight.copy_(old_proj.weight)
+                if old_proj.bias is not None:
+                    new_proj.bias.copy_(old_proj.bias)
+
+            new_proj.task_gate = create_task_gate(
+                task_num=task_num,
+                task_embedding_dim=task_embedding_dim,
+                expert_num=expert_num,
+                device=device,
+                temperature=temperature,
+            )
+            new_proj.task_num = task_num
+            new_proj.task_embedding_dim = task_embedding_dim
+            new_proj.expert_num = expert_num
+            new_proj._layer_idx = layer_idx
+            new_proj._proj_name = proj_name
+            new_proj = new_proj.to(device)
+
+            gate_param_total += sum(p.numel() for p in new_proj.task_gate.parameters())
+            setattr(mlp, proj_name, new_proj)
+            replaced_count += 1
+
+            if layer_idx < 2:
+                print(f"  Layer {layer_idx}.{proj_name}: local task_gate created")
+
+    gate_stats = count_projection_gates(model)
+    print(f"\nTotal replaced projections: {replaced_count}")
+    print(
+        "Projection-local gates: "
+        f"gate_up={gate_stats['gate_up']}, down={gate_stats['down']}, "
+        f"total={gate_stats['total']}, params={gate_param_total:,}"
+    )
+    print("Each projection now learns an independent task_id -> expert route.")
+
     return model
 
 
 def patch_phi3mlp_forward():
     """
-    修改 Phi3MLP 的 forward 方法以支持 MMOELoraLinearS（双门控）
-    
-    ✅ gate_up_proj 使用 gate_A
-    ✅ down_proj 使用 gate_B
-    ✅ 通过全局注册表获取门控，避免循环引用
+    Patch Phi3MLP.forward to pass task_id into MMOELoraLinearS projections.
+    The projection itself owns the gate, so no global gate lookup is needed.
     """
-    
-    original_forward = Phi3MLP.forward
-    
+
     def moelora_forward(self, hidden_state, **kwargs):
-        """
-        新的 forward 方法，支持 MMOELoraLinearS + 双门控
-        """
-        # 获取 task_id
-        task_id = kwargs.get('task_id', None)
+        task_id = kwargs.get("task_id", None)
         if task_id is None:
-            task_id = getattr(self, '_task_id', None)
-        
-        # ✅ 通过全局注册表获取两个门控（使用模型 ID）
-        gate_A = None
-        gate_B = None
-        if hasattr(self, '_root_model_id'):
-            model_id = self._root_model_id
-            gates = _DUAL_GATE_REGISTRY.get(model_id, None)
-            if gates:
-                gate_A = gates['gate_A']
-                gate_B = gates['gate_B']
-        
-        # ✅ gate_up_proj 使用 gate_A
+            task_id = getattr(self, "_task_id", None)
+
         if isinstance(self.gate_up_proj, MMOELoraLinearS):
-            gate_up_out = self.gate_up_proj(
-                hidden_state, 
-                task_id=task_id,
-                global_gate=gate_A  # ✅ 传递 gate_A
-            )
+            gate_up_out = self.gate_up_proj(hidden_state, task_id=task_id)
         else:
             gate_up_out = self.gate_up_proj(hidden_state)
-        
-        # Split for gating
+
         gate_proj, up_proj = gate_up_out.chunk(2, dim=-1)
-        
-        # Activation
         intermediate = self.activation_fn(gate_proj) * up_proj
-        
-        # ✅ down_proj 使用 gate_B
+
         if isinstance(self.down_proj, MMOELoraLinearS):
-            down_out = self.down_proj(
-                intermediate, 
-                task_id=task_id,
-                global_gate=gate_B  # ✅ 传递 gate_B
-            )
+            down_out = self.down_proj(intermediate, task_id=task_id)
         else:
             down_out = self.down_proj(intermediate)
-        
+
         if down_out.dtype != hidden_state.dtype:
             down_out = down_out.to(hidden_state.dtype)
         return down_out
-    
+
     Phi3MLP.forward = moelora_forward
-    print("✅ Patched Phi3MLP.forward() to support MMOELoraLinearS with dual independent gates")
+    print("Patched Phi3MLP.forward() for MMOELoraLinearS projection-local gates")
 
 
 def verify_replacement(model):
-    """验证 MLP 层是否成功替换"""
-    print("\n🔍 Verifying MLP replacement...")
-    
+    print("\nVerifying MLP replacement...")
     replaced_count = 0
     total_count = 0
-    
+
     for layer in model.model.layers:
-        if hasattr(layer, 'mlp'):
-            for proj_name in ['gate_up_proj', 'down_proj']:
-                if hasattr(layer.mlp, proj_name):
-                    total_count += 1
-                    proj = getattr(layer.mlp, proj_name)
-                    
-                    if isinstance(proj, MMOELoraLinearS):
-                        replaced_count += 1
-    
-    print(f"  Replaced layers:         {replaced_count}/{total_count}")
-    
+        if not hasattr(layer, "mlp"):
+            continue
+        for proj_name in ("gate_up_proj", "down_proj"):
+            if not hasattr(layer.mlp, proj_name):
+                continue
+            total_count += 1
+            if isinstance(getattr(layer.mlp, proj_name), MMOELoraLinearS):
+                replaced_count += 1
+
+    print(f"  Replaced projections: {replaced_count}/{total_count}")
     if replaced_count == total_count:
-        print("  ✅ All projections successfully replaced!")
-        
-        if hasattr(model, 'global_task_gate_A') and hasattr(model, 'global_task_gate_B'):
-            print(f"  ✅ Dual gates registered")
-        
-        model_id = id(model)
-        if model_id in _DUAL_GATE_REGISTRY:
-            gates = _DUAL_GATE_REGISTRY[model_id]
-            print(f"  ✅ Gates registered in global registry (ID: {model_id})")
-            print(f"     ├─ Gate A registered")
-            print(f"     └─ Gate B registered")
-        
+        print("  All target projections successfully replaced.")
         return True
-    else:
-        print(f"  ⚠️ Warning:  Replacement incomplete")
-        return False
+    print("  Warning: replacement incomplete.")
+    return False
 
 
 def verify_gate_sharing(model):
-    """验证双门控配置"""
-    print("\n🔍 Verifying dual gate configuration...")
-    
-    if not (hasattr(model, 'global_task_gate_A') and hasattr(model, 'global_task_gate_B')):
-        print("  ❌ No dual gates found!")
+    """Verify that every projection has its own gate object."""
+    print("\nVerifying projection-local gate configuration...")
+    projections = list(iter_moelora_projections(model))
+    gate_ids = []
+    missing = []
+
+    for layer_idx, proj_name, proj in projections:
+        gate = get_moelora_gate(proj)
+        if gate is None:
+            missing.append(f"{layer_idx}.{proj_name}")
+        else:
+            gate_ids.append(id(gate))
+
+    unique_gate_count = len(set(gate_ids))
+    gate_stats = count_projection_gates(model)
+    print(f"  MMOELoRA projections: {len(projections)}")
+    print(f"  Gates found:          {len(gate_ids)}")
+    print(f"  Unique gate objects:  {unique_gate_count}")
+    print(f"  Gate params:          {gate_stats['params']:,}")
+
+    for layer_idx, proj_name, proj in projections[:4]:
+        gate = get_moelora_gate(proj)
+        status = "independent" if gate is not None and gate_ids.count(id(gate)) == 1 else "shared/missing"
+        print(f"    Layer {layer_idx}.{proj_name}: {status}")
+
+    if missing:
+        print(f"  Missing task_gate on: {missing[:10]}")
         return False
-    
-    model_id = id(model)
-    gate_a_params = sum(p.numel() for p in model.global_task_gate_A.parameters())
-    gate_b_params = sum(p.numel() for p in model.global_task_gate_B.parameters())
-    
-    # 检查 MLP 是否有模型 ID 引用
-    mlp_with_id = 0
-    for layer in model.model.layers:
-        if hasattr(layer, 'mlp') and hasattr(layer.mlp, '_root_model_id'):
-            mlp_with_id += 1
-    
-    print(f"  ✅ MLPs with model ID reference: {mlp_with_id}/{len(model.model.layers)}")
-    
-    # 检查前几层
-    for layer_idx in [0, 1, model.model.config.num_hidden_layers - 1]:
-        layer = model.model.layers[layer_idx]
-        if hasattr(layer, 'mlp'):
-            print(f"    Layer {layer_idx}:")
-            if isinstance(layer.mlp.gate_up_proj, MMOELoraLinearS):
-                print(f"      ✅ gate_up_proj: Uses Gate A (independent)")
-            if isinstance(layer.mlp.down_proj, MMOELoraLinearS):
-                print(f"      ✅ down_proj: Uses Gate B (independent)")
-    
-    print(f"\n  Summary:")
-    print(f"    Gate A params: {gate_a_params:,}")
-    print(f"    Gate B params: {gate_b_params:,}")
-    print(f"    Total gate params: {gate_a_params + gate_b_params:,}")
-    print(f"  ✅ Dual gate configuration correct!")
-    
+    if unique_gate_count != len(gate_ids):
+        print("  Warning: some projections still share a gate.")
+        return False
+
+    print("  Projection-local gate configuration correct.")
     return True
 
 
 def count_parameters(model):
-    """统计模型参数"""
     total_params = sum(p.numel() for p in model.parameters())
     trainable_params = sum(p.numel() for p in model.parameters() if p.requires_grad)
-    
     lora_params = 0
+    gate_params = 0
+
     for name, param in model.named_parameters():
-        if 'lora' in name.lower() and param.requires_grad:
+        if not param.requires_grad:
+            continue
+        if "lora" in name.lower():
             lora_params += param.numel()
-    
-    # ✅ 分别统计两个门控
-    gate_a_params = 0
-    gate_b_params = 0
-    if hasattr(model, 'global_task_gate_A'):
-        gate_a_params = sum(p.numel() for p in model.global_task_gate_A.parameters() if p.requires_grad)
-    if hasattr(model, 'global_task_gate_B'):
-        gate_b_params = sum(p.numel() for p in model.global_task_gate_B.parameters() if p.requires_grad)
-    
+        if is_moelora_gate_parameter_name(name):
+            gate_params += param.numel()
+
     return {
-        'total': total_params,
-        'trainable': trainable_params,
-        'lora': lora_params,
-        'gate_a': gate_a_params,
-        'gate_b': gate_b_params,
-        'gate_total': gate_a_params + gate_b_params,
-        'ratio': 100 * trainable_params / total_params if total_params > 0 else 0
+        "total": total_params,
+        "trainable": trainable_params,
+        "lora": lora_params,
+        "gate_a": 0,
+        "gate_b": 0,
+        "gate_total": gate_params,
+        "ratio": 100 * trainable_params / total_params if total_params > 0 else 0,
     }
 
 
 def print_parameter_stats(model):
-    """打印参数统计信息"""
     stats = count_parameters(model)
-    
-    print("\n" + "="*60)
-    print("📊 Parameter Statistics (Dual Gate):")
+    gate_stats = count_projection_gates(model)
+
+    print("\n" + "=" * 60)
+    print("Parameter Statistics (Projection-Local Gates):")
     print(f"  Total params:              {stats['total']:>15,}")
-    print(f"  Trainable params:         {stats['trainable']:>15,}")
-    print(f"    ├─ LoRA params:         {stats['lora']:>15,}")
-    print(f"    ├─ Gate A params:       {stats['gate_a']:>15,}")
-    print(f"    └─ Gate B params:       {stats['gate_b']:>15,}")
-    print(f"  Total gate params:        {stats['gate_total']:>15,}")
-    print(f"  Trainable ratio:          {stats['ratio']:>14.4f}%")
-    print("="*60)
+    print(f"  Trainable params:          {stats['trainable']:>15,}")
+    print(f"  LoRA params:               {stats['lora']:>15,}")
+    print(f"  Gate params:               {stats['gate_total']:>15,}")
+    print(f"  Gate modules:              {gate_stats['total']:>15,}")
+    print(f"  Trainable ratio:           {stats['ratio']:>14.4f}%")
+    print("=" * 60)

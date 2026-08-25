@@ -29,6 +29,7 @@ def check_if_moelora_checkpoint(model_path):
             has_lora_A = False
             has_lora_B = False
             has_dual_gates = False
+            has_projection_gates = False
             
             for shard_file in sorted(safetensor_files):
                 shard_path = os.path.join(model_path, shard_file)
@@ -42,10 +43,15 @@ def check_if_moelora_checkpoint(model_path):
                         has_lora_B = True
                     if any('global_task_gate_A' in k for k in keys) and any('global_task_gate_B' in k for k in keys):
                         has_dual_gates = True
+                    if any('.task_gate.' in k for k in keys):
+                        has_projection_gates = True
             
-            print(f"   Summary: lora_A={has_lora_A}, lora_B={has_lora_B}, dual_gates={has_dual_gates}")
+            print(
+                f"   Summary: lora_A={has_lora_A}, lora_B={has_lora_B}, "
+                f"dual_gates={has_dual_gates}, projection_gates={has_projection_gates}"
+            )
             
-            if has_lora_A and has_lora_B and has_dual_gates:
+            if has_lora_A and has_lora_B and (has_dual_gates or has_projection_gates):
                 print(f"   ✅ MOELoRA checkpoint detected!")
                 return True
         
@@ -137,13 +143,20 @@ def load_moelora_model_with_weights(model_path, config, expert_num=4, lora_r=16,
     
     from src.MLoRA.peft.tuners.mmoeloraS import MMOELoraLinearS
     
-    # ✅ 检查双门控
-    if hasattr(model.language_model, 'global_task_gate_A') and hasattr(model.language_model, 'global_task_gate_B'):
+    from utils.phi3_moelora_replacement import count_projection_gates
+    gate_stats = count_projection_gates(model.language_model)
+
+    if gate_stats['total'] > 0:
+        print(
+            f"      ✅ Projection-local gates found: "
+            f"{gate_stats['total']} gates ({gate_stats['params']:,} params)"
+        )
+    elif hasattr(model.language_model, 'global_task_gate_A') and hasattr(model.language_model, 'global_task_gate_B'):
         gate_a_params = sum(p.numel() for p in model.language_model.global_task_gate_A.parameters())
         gate_b_params = sum(p.numel() for p in model.language_model.global_task_gate_B.parameters())
         print(f"      ✅ Dual gates found: Gate A ({gate_a_params:,} params) + Gate B ({gate_b_params:,} params)")
     else:
-        print(f"      ❌ Dual gates NOT found!")
+        print(f"      ❌ MOELoRA gates NOT found!")
     
     first_layer = model.language_model.model.layers[0]
     if isinstance(first_layer.mlp.gate_up_proj, MMOELoraLinearS):
@@ -270,7 +283,7 @@ def load_pretrained_model(model_name_or_path, load_type='hf', load_8bit=False, l
         try:
             model = TinyLlavaForConditionalGeneration.from_pretrained(
                 model_name_or_path,
-                low_cpu_mem_usage=True,
+                low_cpu_mem_usage=False,
                 **kwargs_model
             )
             print(f"      ✅ Standard model loaded")
@@ -282,6 +295,23 @@ def load_pretrained_model(model_name_or_path, load_type='hf', load_8bit=False, l
     # ========================================
     # 加载 image_processor
     # ========================================
+    if hasattr(model, "initialize_task_prediction_modules"):
+        model.initialize_task_prediction_modules()
+    if hasattr(model, "materialize_meta_parameters"):
+        materialized = model.materialize_meta_parameters()
+        if materialized:
+            print(f"      Materialized {len(materialized)} meta parameters/buffers before DeepSpeed")
+            for name in materialized[:20]:
+                print(f"         - {name}")
+        meta_params = [name for name, param in model.named_parameters() if param.is_meta]
+        if meta_params:
+            print(f"      Warning: {len(meta_params)} meta parameters remain after materialization")
+            for name in meta_params[:10]:
+                print(f"         - {name}")
+            raise RuntimeError("Meta parameters remain after model load; checkpoint may be incomplete.")
+        else:
+            print(f"      No meta parameters remain after model load")
+
     print(f"\n[2/3] Loading image processor...")
     
     try:
@@ -319,11 +349,19 @@ def load_pretrained_model(model_name_or_path, load_type='hf', load_8bit=False, l
     # 最终总结
     # ========================================
     print(f"\n📊 Model Summary:")
-    if is_moelora and (hasattr(model.language_model, 'global_task_gate_A') or hasattr(model.language_model, 'global_task_gate_B')):
-        print(f"   🎯 MOELoRA Model (Dual Gates)")
-        gate_a = sum(p.numel() for p in model.language_model.global_task_gate_A.parameters()) if hasattr(model.language_model, 'global_task_gate_A') else 0
-        gate_b = sum(p.numel() for p in model.language_model.global_task_gate_B.parameters()) if hasattr(model.language_model, 'global_task_gate_B') else 0
-        print(f"      Gate A + Gate B: {gate_a + gate_b:,} params")
+    if is_moelora:
+        print(f"   🎯 MOELoRA Model")
+        try:
+            from utils.phi3_moelora_replacement import count_projection_gates
+            gate_stats = count_projection_gates(model.language_model)
+        except Exception:
+            gate_stats = {'total': 0, 'params': 0}
+        if gate_stats['total'] > 0:
+            print(f"      Projection-local gates: {gate_stats['total']} ({gate_stats['params']:,} params)")
+        elif hasattr(model.language_model, 'global_task_gate_A') or hasattr(model.language_model, 'global_task_gate_B'):
+            gate_a = sum(p.numel() for p in model.language_model.global_task_gate_A.parameters()) if hasattr(model.language_model, 'global_task_gate_A') else 0
+            gate_b = sum(p.numel() for p in model.language_model.global_task_gate_B.parameters()) if hasattr(model.language_model, 'global_task_gate_B') else 0
+            print(f"      Gate A + Gate B: {gate_a + gate_b:,} params")
     else:
         print(f"   ℹ️ Standard Model")
     

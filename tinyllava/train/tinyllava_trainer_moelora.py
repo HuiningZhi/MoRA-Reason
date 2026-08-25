@@ -42,6 +42,18 @@ class MOELoRATrainer(LLaVATrainer):
         # ✅ 初始化门控统计
         self._last_print_step = -1
     
+    def _set_mora_adapters_enabled(self, model, enabled):
+        previous_states = []
+        for module in model.modules():
+            if hasattr(module, 'disable_adapters') and not callable(getattr(module, 'disable_adapters')):
+                previous_states.append((module, module.disable_adapters))
+                module.disable_adapters = not enabled
+        return previous_states
+
+    def _restore_mora_adapter_states(self, previous_states):
+        for module, previous_state in previous_states:
+            module.disable_adapters = previous_state
+
     def _save(self, output_dir=None, state_dict=None):
         """
         重写保存方法 - 强制使用 safetensors 格式
@@ -188,7 +200,7 @@ class MOELoRATrainer(LLaVATrainer):
             self._sample_log_count = 0
         
         # ✅ 修改6：打印前 10 个样本的验证信息
-        if self._sample_log_count < 10:
+        if self._sample_log_count < 3:
             # 转换
             if isinstance(task_ids, torch.Tensor):
                 task_ids_list = task_ids.cpu().tolist()
@@ -255,18 +267,47 @@ class MOELoRATrainer(LLaVATrainer):
         if current_step > 0 and current_step % 100 == 0 and current_step != self._last_print_step:
             self._print_current_step_weights(llm, task_ids, answer_types, current_step)
             self._last_print_step = current_step       
-        # ✅ 修改10：设置 task_ids 到设备
         device = next(model.parameters()).device
         if not isinstance(task_ids, torch.Tensor):
             task_ids = torch.tensor(task_ids, dtype=torch.long)
         task_ids = task_ids.to(device)
-        
-        # ✅ 修改11：找到 LLM 并设置 task_ids
+
+        prediction_inputs = dict(inputs)
+        prediction_inputs["labels"] = inputs.get("labels", None)
+        prediction_inputs["task_prediction_only"] = True
+        prediction_inputs["return_dict"] = True
         if llm and hasattr(llm, 'model') and hasattr(llm.model, 'layers'):
             for layer in llm.model. layers:
                 if hasattr(layer, 'mlp'):
-                    layer.mlp._task_id = task_ids
-        
+                    layer.mlp._task_id = None
+        adapter_states = self._set_mora_adapters_enabled(actual_model, enabled=False)
+        try:
+            with torch.no_grad():
+                model(**prediction_inputs)
+        finally:
+            self._restore_mora_adapter_states(adapter_states)
+
+        predicted_task_ids = getattr(actual_model, "_last_predicted_task_ids", None)
+        if predicted_task_ids is None:
+            predicted_task_ids = task_ids
+            print("⚠️ No predicted task_ids found; falling back to supervised task_ids for this batch.")
+        predicted_task_ids = predicted_task_ids.to(device=device, dtype=torch.long)
+
+        if not hasattr(self, "_predicted_task_log_count"):
+            self._predicted_task_log_count = 0
+        if self._predicted_task_log_count < 10:
+            print(f"Predicted task_ids for MoRA gate: {predicted_task_ids.detach().cpu().tolist()}")
+            print(f"Supervised task_ids:             {task_ids.detach().cpu().tolist()}")
+            self._predicted_task_log_count += 1
+
+        # ✅ 修改11：找到 LLM 并设置预测得到的 task_ids
+        if llm and hasattr(llm, 'model') and hasattr(llm.model, 'layers'):
+            for layer in llm.model. layers:
+                if hasattr(layer, 'mlp'):
+                    layer.mlp._task_id = predicted_task_ids
+
+        return super().compute_loss(model, inputs, return_outputs, num_items_in_batch)
+
         # ✅ 修改12：调用父类
         return super().compute_loss(model, inputs, return_outputs, num_items_in_batch)
     

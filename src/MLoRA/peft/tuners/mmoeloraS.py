@@ -119,7 +119,10 @@ class MMOELoraLinearS(nn.Module):
         if self.disable_adapters or self.merged or self.r == 0:
             return result
         
-        # ✅ 如果没有提供 global_gate，尝试使用存储的引用（向后兼容）
+        # Prefer a projection-local gate. Keep the legacy global_gate path for
+        # older callers/checkpoints.
+        if global_gate is None:
+            global_gate = getattr(self, "task_gate", None)
         if global_gate is None:
             global_gate = self._global_gate
         

@@ -28,7 +28,7 @@ TASK_NUM=2
 TASK_EMBEDDING_DIM=32
 
 # ✅ 使用 DeepSpeed 进行 4 卡训练
-deepspeed --include localhost:0 --master_port 29501 tinyllava/train/custom_finetune_moelora.py \
+deepspeed --include localhost:0,1,2,3 --master_port 29501 tinyllava/train/custom_finetune_moelora.py \
     --deepspeed ./scripts/zero2.json \
     --data_path  $DATA_PATH \
     --image_folder $IMAGE_PATH \
@@ -40,7 +40,7 @@ deepspeed --include localhost:0 --master_port 29501 tinyllava/train/custom_finet
     --connector_type $CN_VERSION \
     --mm_vision_select_layer -2 \
     --image_aspect_ratio square \
-    --attn_implementation flash_attention_2 \
+    --attn_implementation eager \
     --fp16 True \
     --training_recipe $TRAIN_RECIPE \
     --tune_type_llm frozen \
@@ -48,15 +48,18 @@ deepspeed --include localhost:0 --master_port 29501 tinyllava/train/custom_finet
     --tune_vision_tower_from_layer 0 \
     --tune_type_connector frozen \
     --group_by_modality_length False \
-    --pretrained_model_path /root/autodl-tmp/best/checkpoint-3400 \
-    --output_dir /root/autodl-tmp/output3/tiny-llava-${LLM_VARIANT}-${VT_VARIANT}-${VERSION}-finetune-down-moelora1 \
+    --pretrained_model_path /HNA/outputs/48/tiny-llava-${LLM_VARIANT}-${VT_VARIANT}-${VERSION}-finetune-down-reason-48-5 \
+    --output_dir /HNA/outputs/48/tiny-llava-${LLM_VARIANT}-${VT_VARIANT}-${VERSION}-finetune-down-moelora-48-5 \
     --lora_r $LORA_R \
     --lora_alpha $LORA_ALPHA \
     --lora_dropout $LORA_DROPOUT \
     --expert_num $EXPERT_NUM \
     --task_num $TASK_NUM \
     --task_embedding_dim $TASK_EMBEDDING_DIM \
-    --num_train_epochs 4 \
+    --task_head_lr 0.00002  \
+    --task_loss_weight 0.1 \
+    --enable_task_prediction True \
+    --num_train_epochs 6 \
     --per_device_train_batch_size 1 \
     --per_device_eval_batch_size 4 \
     --gradient_accumulation_steps 4 \
@@ -72,7 +75,7 @@ deepspeed --include localhost:0 --master_port 29501 tinyllava/train/custom_finet
     --tf32 False \
     --model_max_length $MODEL_MAX_LENGTH \
     --gradient_checkpointing False \
-    --dataloader_num_workers 8 \
+    --dataloader_num_workers 0 \
     --lazy_preprocess True \
     --report_to tensorboard \
     --tokenizer_use_fast False \

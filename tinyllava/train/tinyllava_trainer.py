@@ -136,6 +136,24 @@ class LLaVATrainer(Trainer):
         else:
             return super()._get_train_sampler()
 
+    def log(self, logs, *args, **kwargs):
+        if "loss" in logs:
+            actual_model = self.model
+            if hasattr(actual_model, "module"):
+                actual_model = actual_model.module
+            if hasattr(actual_model, "module"):
+                actual_model = actual_model.module
+
+            answer_loss = getattr(actual_model, "_last_answer_loss", None)
+            task_loss = getattr(actual_model, "_last_task_loss", None)
+
+            if answer_loss is not None:
+                logs["answer_loss"] = round(answer_loss.detach().float().item(), 4)
+            if task_loss is not None:
+                logs["task_loss"] = round(task_loss.detach().float().item(), 4)
+
+        return super().log(logs, *args, **kwargs)
+
     def create_optimizer(self):
         """
         Setup the optimizer.
@@ -153,19 +171,24 @@ class LLaVATrainer(Trainer):
         if self.optimizer is None:
             decay_parameters = get_parameter_names(opt_model, ALL_LAYERNORM_LAYERS)
             decay_parameters = [name for name in decay_parameters if "bias" not in name]
+            task_classifier_parameters = [
+                name for name, _ in opt_model.named_parameters()
+                if "task_classifier" in name
+            ]
+            task_head_lr = getattr(self.args, "task_head_lr", None)
             if self.args.mm_projector_lr is not None:
                 connector_parameters = [name for name, _ in opt_model.named_parameters() if "connector" in name]
                 optimizer_grouped_parameters = [
                     {
                         "params": [
-                            p for n, p in opt_model.named_parameters() if (n in decay_parameters and n not in connector_parameters and p.requires_grad)
+                            p for n, p in opt_model.named_parameters() if (n in decay_parameters and n not in connector_parameters and n not in task_classifier_parameters and p.requires_grad)
                         ],
                         "weight_decay": self.args.weight_decay,
                         "name": "decay_no_connector_parameters"
                     },
                     {
                         "params": [
-                            p for n, p in opt_model.named_parameters() if (n not in decay_parameters and n not in connector_parameters and p.requires_grad)
+                            p for n, p in opt_model.named_parameters() if (n not in decay_parameters and n not in connector_parameters and n not in task_classifier_parameters and p.requires_grad)
                         ],
                         "weight_decay": 0.0,
                         "name": "no_decay_no_connector_parameters"
@@ -191,19 +214,33 @@ class LLaVATrainer(Trainer):
                 optimizer_grouped_parameters = [
                     {
                         "params": [
-                            p for n, p in opt_model.named_parameters() if (n in decay_parameters and p.requires_grad)
+                            p for n, p in opt_model.named_parameters() if (n in decay_parameters and n not in task_classifier_parameters and p.requires_grad)
                         ],
                         "weight_decay": self.args.weight_decay,
                         "name": "decay_parameters"
                     },
                     {
                         "params": [
-                            p for n, p in opt_model.named_parameters() if (n not in decay_parameters and p.requires_grad)
+                            p for n, p in opt_model.named_parameters() if (n not in decay_parameters and n not in task_classifier_parameters and p.requires_grad)
                         ],
                         "weight_decay": 0.0,
                         "name": "no_decay_parameters"
                     },
                 ]
+            if task_head_lr is not None:
+                task_head_params = [
+                    p for n, p in opt_model.named_parameters()
+                    if n in task_classifier_parameters and p.requires_grad
+                ]
+                if task_head_params:
+                    optimizer_grouped_parameters.append(
+                        {
+                            "params": task_head_params,
+                            "weight_decay": 0.0,
+                            "lr": task_head_lr,
+                            "name": "task_prediction_parameters",
+                        }
+                    )
 
             if getattr(self.args, "moe_enable", False):
                 from deepspeed.moe.utils import split_params_into_different_moe_groups_for_optimizer
@@ -226,7 +263,3 @@ class LLaVATrainer(Trainer):
                 logger.info(f"skipped: {skipped/2**20}M params")
 
         return self.optimizer
-
-
-
-

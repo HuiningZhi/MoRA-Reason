@@ -50,6 +50,9 @@ class TrainingArguments(transformers.TrainingArguments):
     expert_num: int = field(default=4, metadata={"help": "Number of MOELoRA experts"})
     task_num: int = field(default=2, metadata={"help": "Number of tasks"})
     task_embedding_dim: int = field(default=32, metadata={"help": "Dimension of task embedding"})
+    task_head_lr: float = field(default=1e-3, metadata={"help": "Learning rate for task token and task classifier"})
+    task_loss_weight: float = field(default=1.0, metadata={"help": "Weight for task classification loss"})
+    enable_task_prediction: bool = field(default=True, metadata={"help": "Enable learnable task token and task classifier"})
     
     training_recipe: str = field(default='common')
     tune_type_llm: str = field(default="frozen") # support only: frozen, full, lora, qlora_int4, qlora_int8

@@ -28,7 +28,9 @@ from utils.phi3_moelora_replacement import (
     patch_phi3mlp_forward,
     verify_replacement,
     verify_gate_sharing,
-    print_parameter_stats
+    print_parameter_stats,
+    is_moelora_gate_parameter_name,
+    print_moelora_gate_samples
 )
 from src.MLoRA.peft.tuners.mmoeloraS import MMOELoraLinearS
 
@@ -53,6 +55,12 @@ class DualGateWeightCallback(transformers.TrainerCallback):
             self.last_print_step = current_step
     
     def _print_gate_weights(self, state):
+        print_moelora_gate_samples(
+            self.llm_model,
+            title=f"EXPERT GATE WEIGHTS (Step {state.global_step}, Epoch {state.epoch:.2f})",
+            max_layers=5,
+        )
+        return
         """打印门控权重"""
         print("\n" + "="*80)
         print(f"🎯 EXPERT GATE WEIGHTS (Step {state.global_step}, Epoch {state.epoch:.2f})")
@@ -166,7 +174,7 @@ def analyze_model_parameters(model):
                 stats['lora_A'] += num_params
             elif 'lora_B' in name:
                 stats['lora_B'] += num_params
-            elif 'global_task_gate_A' in name or 'global_task_gate_B' in name:
+            elif is_moelora_gate_parameter_name(name):
                 stats['global_gate'] += num_params
             elif 'connector' in name:
                 stats['connector'] += num_params
@@ -311,8 +319,8 @@ def create_optimizer_with_custom_lr(model, llm_model, training_arguments):
     
     for name, param in model.named_parameters():
         if param.requires_grad:
-            # ✅ 检查双门控
-            if 'global_task_gate_A' in name or 'global_task_gate_B' in name:
+            # MOELoRA projection-local task gates
+            if is_moelora_gate_parameter_name(name):
                 gate_params.append(param)
                 gate_param_names.append(name)
             else:
@@ -328,7 +336,7 @@ def create_optimizer_with_custom_lr(model, llm_model, training_arguments):
     print(f"{'='*80}")
     print(f"{'Group':<30} {'Parameters':>15} {'Learning Rate':>20}")
     print(f"{'-'*80}")
-    print(f"{'Gates (global_task_gate_A/B)':<30} {gate_count:>15,} {gate_lr:>20.2e}")
+    print(f"{'Gates (task_gate)':<30} {gate_count:>15,} {gate_lr:>20.2e}")
     print(f"{'Other (LoRA, etc.)':<30} {other_count:>15,} {base_lr:>20.2e}")
     print(f"{'-'*80}")
     print(f"{'Total Trainable':<30} {total_trainable:>15,}")
@@ -416,6 +424,12 @@ def train():
     model, tokenizer, image_processor, context_len = load_pretrained_model(
         training_arguments.pretrained_model_path
     )
+    model.config.task_num = getattr(training_arguments, 'task_num', 2)
+    model.config.task_loss_weight = getattr(training_arguments, 'task_loss_weight', 1.0)
+    model.config.enable_task_prediction = getattr(training_arguments, 'enable_task_prediction', True)
+    model.task_num = model.config.task_num
+    model.task_loss_weight = model.config.task_loss_weight
+    model.enable_task_prediction = model.config.enable_task_prediction
     config = model.config
     
     # ========================================
@@ -440,10 +454,10 @@ def train():
     print(f"\n📋 Task Mapping:")
     print(f"  OPEN → Task ID 0")
     print(f"  CLOSED → Task ID 1")
-    print(f"\n📋 Dual Gate Configuration:")
-    print(f"  Gate A: Used by gate_up_proj")
-    print(f"  Gate B: Used by down_proj")
-    print(f"  Both gates trained independently")
+    print(f"\n📋 Projection-Local Gate Configuration:")
+    print(f"  Each gate_up_proj has its own task_gate")
+    print(f"  Each down_proj has its own task_gate")
+    print(f"  All gates receive the same task_id input")
     
     # 找到并替换 LLM
     llm_model = None
@@ -514,6 +528,15 @@ def train():
             param.requires_grad = True
             lora_count += 1
     print(f"  ✅ Unfrozen {lora_count} LoRA parameters")
+
+    gate_tensor_count = 0
+    gate_param_count = 0
+    for name, param in model.named_parameters():
+        if is_moelora_gate_parameter_name(name):
+            param.requires_grad = True
+            gate_tensor_count += 1
+            gate_param_count += param.numel()
+    print(f"  Unfrozen projection-local gates: {gate_tensor_count} tensors ({gate_param_count:,} params)")
     
     # ✅ 解冻双门控
     if hasattr(llm_model, 'global_task_gate_A') and hasattr(llm_model, 'global_task_gate_B'):
@@ -551,7 +574,7 @@ def train():
     # ✅ 新增：训练前双门控权重可视化
     # ========================================
     print("\n" + "="*80)
-    print("🎯 INITIAL EXPERT GATE WEIGHTS (初始 - 双门控)")
+    print("🎯 INITIAL EXPERT GATE WEIGHTS (projection-local gates)")
     print("="*80)
     
     # 获取 LLM 模型
@@ -560,8 +583,15 @@ def train():
         llm_model = model.language_model
     elif hasattr(model, 'llm'):
         llm_model = model.llm
+
+    if llm_model:
+        print_moelora_gate_samples(
+            llm_model,
+            title="INITIAL EXPERT GATE WEIGHTS (projection-local gates)",
+            max_layers=2,
+        )
     
-    if llm_model and (hasattr(llm_model, 'global_task_gate_A') or hasattr(llm_model, 'global_task_gate_B')):
+    if False and llm_model and (hasattr(llm_model, 'global_task_gate_A') or hasattr(llm_model, 'global_task_gate_B')):
         # 任务映射
         task_mapping = {
             'OPEN': 0,
@@ -650,7 +680,7 @@ def train():
     # 13. 最终门控权重
     # ========================================
     print("\n" + "="*80)
-    print("🎯 FINAL EXPERT GATE WEIGHTS (训练完成)")
+    print("🎯 FINAL EXPERT GATE WEIGHTS (projection-local gates)")
     print("="*80)
     
     task_mapping = {
@@ -658,7 +688,14 @@ def train():
         'CLOSED': 1
     }
     
-    if llm_model and (hasattr(llm_model, 'global_task_gate_A') or hasattr(llm_model, 'global_task_gate_B')):
+    if llm_model:
+        print_moelora_gate_samples(
+            llm_model,
+            title="FINAL EXPERT GATE WEIGHTS (projection-local gates)",
+            max_layers=2,
+        )
+
+    if False and llm_model and (hasattr(llm_model, 'global_task_gate_A') or hasattr(llm_model, 'global_task_gate_B')):
         with torch.no_grad():
             for task_name, task_id in task_mapping.items():
                 gate_a_device = next(llm_model.global_task_gate_A.parameters()).device if hasattr(llm_model, 'global_task_gate_A') else 'cpu'

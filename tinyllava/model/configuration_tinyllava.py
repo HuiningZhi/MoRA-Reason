@@ -37,6 +37,9 @@ class TinyLlavaConfig(PretrainedConfig):
         tune_type_connector = 'frozen',
         tune_type_vision_tower = 'frozen',
         tune_vision_tower_from_layer = -1,
+        task_num = 2,
+        task_loss_weight = 1.0,
+        enable_task_prediction = True,
         
         **kwargs
 
@@ -50,6 +53,9 @@ class TinyLlavaConfig(PretrainedConfig):
         self.tune_type_connector = tune_type_connector
         self.tune_type_vision_tower = tune_type_vision_tower
         self.tune_vision_tower_from_layer = tune_vision_tower_from_layer
+        self.task_num = task_num
+        self.task_loss_weight = task_loss_weight
+        self.enable_task_prediction = enable_task_prediction
         
         self.ignore_index = IGNORE_INDEX
         self.image_token_index = IMAGE_TOKEN_INDEX
@@ -88,6 +94,9 @@ class TinyLlavaConfig(PretrainedConfig):
         self.tokenizer_use_fast = getattr(config, 'tokenizer_use_fast', False)
         self.tokenizer_model_max_length = getattr(config, 'model_max_length', 2048)
         self.tokenizer_padding_side = getattr(config, 'tokenizer_padding_side', 'right')
+        self.task_num = getattr(config, 'task_num', 2)
+        self.task_loss_weight = getattr(config, 'task_loss_weight', 1.0)
+        self.enable_task_prediction = getattr(config, 'enable_task_prediction', True)
         
         self._load_text_config()
         self._load_vision_config()
@@ -130,4 +139,3 @@ class TinyLlavaConfig(PretrainedConfig):
         self.vision_config.model_name_or_path2 = self.vision_model_name_or_path2.split(':')[-1]
         self.vision_hidden_size = getattr(self.vision_config, 'hidden_size',  None)  
         
-

@@ -1,5 +1,10 @@
 import tokenizers
+import sys
+import os
 from transformers import AutoTokenizer, AutoModelForCausalLM, AutoImageProcessor
+
+project_root = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+sys.path.insert(0, project_root)
 
 from tinyllava.train.tinyllava_trainer import LLaVATrainer
 from tinyllava.training_recipe import TrainingRecipeFactory
@@ -36,6 +41,12 @@ def train():
     config = model.config
     # tokenizer = AutoTokenizer.from_pretrained(training_arguments.pretrained_model_path, use_fast=False, model_max_length = config.tokenizer_model_max_length,padding_side = config.tokenizer_padding_side)
     model.tokenizer = tokenizer
+    model.config.task_num = getattr(training_arguments, 'task_num', 2)
+    model.config.task_loss_weight = getattr(training_arguments, 'task_loss_weight', 1.0)
+    model.config.enable_task_prediction = getattr(training_arguments, 'enable_task_prediction', True)
+    model.task_num = model.config.task_num
+    model.task_loss_weight = model.config.task_loss_weight
+    model.enable_task_prediction = model.config.enable_task_prediction
     model = training_recipe(model)
     model.config.use_cache = False
     model.config.image_aspect_ratio = data_arguments.image_aspect_ratio
