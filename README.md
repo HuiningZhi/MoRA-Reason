@@ -5,3 +5,8 @@
 The Med-3VQA-Reason dataset is available at:
 
 https://drive.google.com/drive/folders/1wv_E1z-cIEixU2Ymh69MOkTuCiRvsVeh?usp=sharing
+
+
+## Model Weights
+
+The model weights of MoRA-Reason will be released on Hugging Face.
